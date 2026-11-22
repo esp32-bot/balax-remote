@@ -4,14 +4,17 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "vite --port 5180 --host",
     "build": "vite build",
+    "test": "node --experimental-test-module-mocks --test telemetryBridgePlugin.test.ts",
     "preview": "vite preview"
   },
   "dependencies": {
     "@g-ai/rc": "file:../../g-ai/rc",
     "react": "^19.2.4",
-    "react-dom": "^19.2.4"
+    "react-dom": "^19.2.4",
+    "@babylonjs/core": "8.56.2",
+    "@g-ai/3d-ui": "file:../../g-ai/3d-ui"
   },
   "devDependencies": {
     "@types/react": "^19.2.14",

@@ -16,7 +16,7 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   overflow-x: hidden;
 }
-button, input {
+:where(button, input):not([class*="foss-earth-"]):not([class*="game-log"]) {
   background: #21262d;
   color: var(--text);
   border: 1px solid var(--border);
@@ -28,3 +28,84 @@ button, input {
 button.primary { background: #1f6feb; border-color: #388bfd; font-weight: 600; }
 button.success { background: var(--success); border-color: #2ea043; font-weight: 600; }
 button.danger { background: var(--danger); border-color: #f85149; font-weight: 600; }
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  font-weight: 600;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(15, 23, 42, 0.72);
+  color: #cbd5e1;
+}
+.badge.online {
+  border-color: rgba(63, 185, 80, 0.65);
+  color: #3fb950;
+}
+.badge.offline {
+  border-color: rgba(148, 163, 184, 0.35);
+  color: #8b949e;
+}
+.balax-controls {
+  position: absolute;
+  right: max(12px, env(safe-area-inset-right, 0px));
+  bottom: max(12px, env(safe-area-inset-bottom, 0px));
+  left: max(12px, env(safe-area-inset-left, 0px));
+  z-index: 15;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 10px;
+  pointer-events: none;
+}
+.balax-hud, .balax-joystick {
+  pointer-events: auto;
+}
+.balax-hud {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  min-width: 0;
+  gap: 6px;
+  padding: 6px 10px;
+  background: rgba(8, 15, 27, 0.92);
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 10px;
+  backdrop-filter: blur(14px);
+  font-size: 0.78rem;
+}
+.balax-joystick {
+  flex: none;
+  width: clamp(76px, 21vw, 118px);
+  aspect-ratio: 1;
+  text-align: center;
+}
+html[data-log-visible="false"] .balax-game-log {
+  --game-log-max-width: min(380px, calc(100vw - 24px));
+  top: auto;
+  bottom: calc(var(--balax-controls-height, 118px) + 20px + env(safe-area-inset-bottom, 0px));
+  left: max(12px, env(safe-area-inset-left, 0px));
+  transform: none;
+  align-items: flex-start;
+}
+html[data-log-visible="false"] .balax-game-log .game-log__lines {
+  align-items: flex-start;
+}
+.balax-flash-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  font-size: 0.72rem;
+}
+.balax-flash-table th, .balax-flash-table td {
+  padding: 4px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+.balax-flash-table th { font-weight: 500; }
+.balax-flash-table th small, .balax-flash-table td small {
+  display: block;
+  color: var(--muted);
+}
