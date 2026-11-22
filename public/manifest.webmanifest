@@ -1,0 +1,9 @@
+{
+  "name": "BalaX Remote & Live Studio",
+  "short_name": "BalaX",
+  "start_url": ".",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#0d1117",
+  "theme_color": "#0d1117"
+}
