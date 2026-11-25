@@ -116,7 +116,7 @@ export function BalaXBabylonScene({
     const sun = new DirectionalLight("sun", new Vector3(-0.6, -1.0, -0.4), scene);
     sun.intensity = 0.7;
 
-    // Ground & 0SFS-style coordinate grid lines
+    // Ground & metric coordinate grid lines
     const ground = CreateGround("ground", { width: 4, height: 4 }, scene);
     const groundMat = new StandardMaterial("ground-mat", scene);
     groundMat.diffuseColor = new Color3(0.04, 0.06, 0.09);
@@ -195,28 +195,30 @@ export function BalaXBabylonScene({
     baseCradle.position.y = 0.008;
     baseCradle.material = darkCradleMat;
 
-    // M5StickC Plus body (25mm wide, 68mm tall, 14mm deep)
+    // M5StickC Plus body (25mm wide, 68mm tall, 14mm deep).
+    // The HAT plugs into the BalaC, so the shell is upside down versus handheld:
+    // button A (USB end) is at the top, and the LED (HAT end) is just above the cradle.
     const stickBody = CreateBox("stick-body", { width: 0.025, height: 0.068, depth: 0.015 }, scene);
     stickBody.parent = robotRoot;
     stickBody.position.y = 0.048;
     stickBody.material = orangeMat;
 
-    // M5StickC Plus 1.14" IPS LCD screen (faces +Z Forward)
+    // 1.14" IPS LCD, facing +Z. Glass sits below the button once the shell is flipped.
     const lcd = CreateBox("stick-lcd", { width: 0.018, height: 0.034, depth: 0.001 }, scene);
     lcd.parent = robotRoot;
-    lcd.position = new Vector3(0, 0.056, 0.0078);
+    lcd.position = new Vector3(0, 0.040, 0.0078);
     lcd.material = screenMat;
 
-    // Home "M5" Button A
+    // Home "M5" button A, at the top of the robot.
     const btnA = CreateBox("stick-btn-a", { width: 0.012, height: 0.009, depth: 0.0015 }, scene);
     btnA.parent = robotRoot;
-    btnA.position = new Vector3(0, 0.028, 0.0079);
+    btnA.position = new Vector3(0, 0.068, 0.0079);
     btnA.material = btnMat;
 
-    // Status LED on top
+    // Status LED on the exposed front face just above the cradle (180° also swaps its side).
     const led = CreateBox("stick-led", { width: 0.005, height: 0.003, depth: 0.003 }, scene);
     led.parent = robotRoot;
-    led.position = new Vector3(0.007, 0.081, 0.006);
+    led.position = new Vector3(-0.007, 0.023, 0.006);
     led.material = ledMat;
 
     // Left & Right wheels parented via axle hubs directly under robotRoot

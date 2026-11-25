@@ -12,7 +12,7 @@ export default defineConfig({
     allowedHosts: ["balax-remote.local", ".local", "localhost"],
   },
   resolve: {
-    dedupe: ["react", "react-dom"],
+    dedupe: ["react", "react-dom", "@g-ai/ui"],
     alias: {
       react: path.resolve(import.meta.dirname, "node_modules/react"),
       "react-dom": path.resolve(import.meta.dirname, "node_modules/react-dom"),

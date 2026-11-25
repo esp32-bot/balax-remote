@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
+import type { CamBridgeStatus } from "./cameraProtocol";
 import type { FlashSnapshot } from "./flashProtocol";
 
 export interface RobotHealth {
@@ -24,8 +25,14 @@ export interface RobotHealth {
   wifiTxDbm: number | null;
   wifiRssi: number | null;
   wifiChannel: number | null;
+  wifiPhase?: string | null;
   wifiSsid: string | null;
   wifiIp: string | null;
+  apSsid?: string | null;
+  apClients?: number | null;
+  remoteLive?: boolean | null;
+  remoteMsgs?: number | null;
+  remoteFailed?: number | null;
   streamActive: boolean | null;
   streamRamChunks: number | null;
   streamRamBytes: number | null;
@@ -41,6 +48,9 @@ export interface RobotHealth {
   cacheMisses?: number | null;
   cacheKb?: number | null;
   cacheEntries?: number | null;
+  powerMode?: string | null;
+  idleS?: number | null;
+  idleSleepS?: number | null;
   updatedAtMs: number;
 }
 
@@ -172,6 +182,67 @@ const labelStyle: React.CSSProperties = {
   color: "var(--muted)",
   fontSize: "0.68rem",
 };
+
+function cameraBytes(bytes: number | null | undefined): string {
+  return bytes == null ? "—" : fmtKb(bytes);
+}
+
+function cameraLoad(percent: number | null | undefined): string {
+  return percent == null ? "—" : `${percent.toFixed(1)}%`;
+}
+
+export function CameraSystemMonitor({ kind, status, children }: {
+  kind: "cpu" | "ram" | "flash";
+  status: CamBridgeStatus | null;
+  children: React.ReactNode;
+}) {
+  const live = status?.available && status.powerMode !== "sleep" ? status : null;
+  const system = live?.system;
+  const metrics = {
+    cpu: [
+      ["Active clock", live?.cpuMhz == null ? "—" : `${live.cpuMhz} MHz${live.cpuDfs ? " (DFS)" : ""}`],
+      ["Idle clock", live ? `${live.idleCpuMhz} MHz` : "—"],
+      ["Die thermal", live?.dieTempC == null ? "—" : `${live.dieTempC}°C (${live.thermalState})`],
+      ["Core 0 load", cameraLoad(system?.cpu0LoadPct)],
+      ["Core 1 load", cameraLoad(system?.cpu1LoadPct)],
+    ],
+    ram: [
+      ["Free internal RAM", cameraBytes(live?.freeDram)],
+      ["Total internal RAM", cameraBytes(system?.dramTotalBytes)],
+      ["Minimum free internal RAM", cameraBytes(system?.dramMinFreeBytes)],
+      ["Free PSRAM", cameraBytes(live?.freePsram)],
+      ["Total PSRAM", cameraBytes(system?.psramTotalBytes)],
+      ["Minimum free PSRAM", cameraBytes(system?.psramMinFreeBytes)],
+    ],
+    flash: [
+      ["Total SPI flash", cameraBytes(system?.flashTotalBytes)],
+      ["Running partition", system?.runningPartition ?? "—"],
+      ["Running partition capacity", cameraBytes(system?.runningPartitionBytes)],
+    ],
+  }[kind];
+  const unavailable = status?.powerMode === "sleep" ? "Deep sleep · polling paused"
+    : !live ? "Waiting for live camera status"
+      : !system ? "This firmware or connection provides limited metrics" : null;
+
+  return (
+    <>
+      <section aria-label="ESP32-CAM" style={{ padding: "12px 12px 0", fontSize: "0.78rem" }}>
+        <h3 style={{ margin: "0 0 6px", fontSize: "0.85rem" }}>ESP32-CAM</h3>
+        {unavailable && <div role="status" style={labelStyle}>{unavailable}</div>}
+        {live && <dl style={{ display: "flex", flexWrap: "wrap", gap: 6, margin: "6px 0 0" }}>
+          {metrics.map(([label, value]) => <div key={label} style={cardStyle}>
+            <dt style={labelStyle}>{label}</dt>
+            <dd style={{ margin: 0, fontWeight: 600 }}>{value}</dd>
+          </div>)}
+        </dl>}
+      </section>
+      <section aria-label="BalaX">
+        <h3 style={{ margin: "12px 12px 0", fontSize: "0.85rem" }}>BalaX</h3>
+        {children}
+      </section>
+    </>
+  );
+}
 
 export const CpuPanel: React.FC<{
   connected: boolean;

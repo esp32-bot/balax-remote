@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { detectRuntimeMode, getRuntimeMode } from "./runtimeMode";
 import {
   ActiveImuCalibration,
   evaluateHilCapture,
@@ -203,6 +204,7 @@ export function CalibrationHilPanel({
     let alive = true;
     (async () => {
       try {
+        if ((await detectRuntimeMode()) !== "bridge") return;
         const res = await fetch("/api/bridge/hil");
         if (!res.ok) return;
         const data = (await res.json()) as { captures?: { name: string }[] };
@@ -226,6 +228,7 @@ export function CalibrationHilPanel({
   }, []);
 
   async function saveHilToBridge(capture: HilCapture) {
+    if (getRuntimeMode() !== "bridge") return;
     try {
       await fetch("/api/bridge/hil", {
         method: "POST",

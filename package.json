@@ -6,15 +6,17 @@
   "scripts": {
     "dev": "vite --port 5180 --host",
     "build": "vite build",
-    "test": "node --experimental-test-module-mocks --test telemetryBridgePlugin.test.ts",
+    "test": "node --experimental-test-module-mocks --test telemetryBridgePlugin.test.ts usbFlash.test.ts camBridge.test.ts workspaceMigration.test.ts deviceControls.test.ts browserEcl.test.ts",
     "preview": "vite preview"
   },
   "dependencies": {
-    "@g-ai/rc": "file:../../g-ai/rc",
-    "react": "^19.2.4",
-    "react-dom": "^19.2.4",
     "@babylonjs/core": "8.56.2",
-    "@g-ai/3d-ui": "file:../../g-ai/3d-ui"
+    "@g-ai/3d-ui": "file:../../g-ai/3d-ui",
+    "@g-ai/rc": "file:../../g-ai/rc",
+    "@g-ai/ui": "file:../../g-ai/ui",
+    "esptool-js": "^0.7.1",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
   },
   "devDependencies": {
     "@types/react": "^19.2.14",

@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { getRuntimeMode } from "./runtimeMode";
 import {
   BALAX_PROGRAM_TEMPLATES,
   BalaXArtifactMeta,
@@ -91,7 +92,7 @@ export const ProgramsPanel: React.FC<ProgramsPanelProps> = ({ connected }) => {
   }, []);
 
   const refreshRobot = useCallback(async () => {
-    if (!connected) return;
+    if (!connected || getRuntimeMode() !== "bridge") return;
     try {
       const [stRes, caRes] = await Promise.all([
         fetch("/api/bridge/prog/status"),

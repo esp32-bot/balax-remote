@@ -1,0 +1,73 @@
+.camera-panel {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  font-size: 0.8rem;
+  --globe-accent: var(--accent);
+}
+
+.camera-panel .foss-earth-panel-sections {
+  padding: 0;
+}
+
+.camera-state {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px 8px;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+}
+
+.camera-preview {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 40vh;
+  object-fit: contain;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #080d14;
+}
+
+.camera-metrics {
+  margin: 0;
+}
+
+.camera-metrics > div {
+  padding: 2px 5px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.camera-metrics dt {
+  font-size: 0.7rem;
+  color: var(--muted);
+}
+
+.camera-metrics dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.camera-actions {
+  align-items: center;
+}
+
+.camera-pending {
+  color: var(--muted);
+}
+
+.camera-flash-progress {
+  display: grid;
+  gap: 3px;
+}
+
+.camera-flash-progress > progress {
+  width: 100%;
+  height: 0.5rem;
+  accent-color: var(--accent);
+}

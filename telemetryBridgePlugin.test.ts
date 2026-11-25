@@ -83,7 +83,12 @@ ${headers}
   assert.equal(parsed.partitions[3].imageBytes, null);
 });
 
-type BridgeRequest = Readable & { url: string; method: string; headers: Record<string, string> };
+type BridgeRequest = Readable & {
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  socket: { remoteAddress: string; localAddress: string };
+};
 type BridgeResponse = {
   statusCode: number;
   setHeader: (name: string, value: string) => void;
@@ -104,6 +109,7 @@ test("Flash bridge lifecycle with authenticated console and simulated robot", as
         });
         otaProcess = proc;
         setImmediate(() => {
+          proc.stderr.emit("data", Buffer.from("\r########## 50.0%\r"));
           proc.stdout.emit("data", Buffer.from('{"ok":true,"partition":"ota_1"}'));
           proc.emit("close", 0);
         });
@@ -127,25 +133,53 @@ test("Flash bridge lifecycle with authenticated console and simulated robot", as
     assert.ok(isBinary(file));
     return { size: binary.length, mtimeMs: 1000 };
   });
+  // The USB serial ports the bridge finds in /dev: none until a step plugs one in.
+  let devSerialNames: string[] = [];
+  const realReaddirSync = fs.readdirSync;
+  t.mock.method(fs, "readdirSync", (dir: fs.PathLike, options?: unknown) => {
+    if (String(dir) !== "/dev") return (realReaddirSync as (dir: fs.PathLike, options?: unknown) => unknown)(dir, options);
+    return devSerialNames.map((name) => ({ name, isCharacterDevice: () => true }));
+  });
 
   let streamStatus = 200;
+  let streamPowerHeader: string | null = null;
+  let offReply = "Entering USB-charge off (deep sleep; reboot via USB RTS->EN).\n";
+  const sentPowerCmds: string[] = [];
+  const sentDriveBodies: string[] = [];
+  let sleepProbeCount = 0;
+  let probeFails = false;
+  let probeUsbV = 0.0;
   let uptime = 120;
   let partitionsOutput = PARTITIONS;
   let partitionsStatus = 200;
   let partitionReads = 0;
   let streamReads = 0;
+  let hasFactory = false;
+  let isStub = false;
+  let enterStatus = 500;
   let delayedPartitions: Promise<void> | null = null;
   let partitionsStarted: (() => void) | null = null;
   t.mock.method(globalThis, "fetch", async (input: string, init?: RequestInit) => {
     const url = new URL(input);
     assert.equal(url.hostname, "192.0.2.1");
-    if (url.pathname === "/api/challenge") return Response.json({ nonce: "ab".repeat(16) });
+    if (url.pathname === "/api/challenge") {
+      return Response.json({ nonce: "ab".repeat(16), has_factory: hasFactory, is_stub: isStub, partition: isStub ? "factory" : "ota_0" });
+    }
     const headers = new Headers(init?.headers);
     assert.equal(headers.get("x-nonce"), "ab".repeat(16));
     assert.match(headers.get("x-signature") ?? "", /^[\da-f]{64}$/);
+    if (url.pathname === "/api/ota/enter") return new Response(null, { status: enterStatus });
     if (url.pathname === "/api/stream") {
       streamReads++;
-      return new Response(null, { status: streamStatus });
+      const resHeaders: Record<string, string> = {};
+      if (streamPowerHeader) resHeaders["X-Power-Mode"] = streamPowerHeader;
+      return new Response(null, { status: streamStatus, headers: resHeaders });
+    }
+    if (url.pathname === "/api/drive") {
+      assert.equal(init?.method, "POST");
+      const payload = Buffer.from(init?.body as Uint8Array).toString("utf8");
+      sentDriveBodies.push(payload);
+      return new Response("ok", { status: 200, headers: { "X-Next-Nonce": "ab".repeat(16) } });
     }
     assert.equal(url.pathname, "/api/cmd");
     assert.equal(init?.method, "POST");
@@ -156,7 +190,30 @@ test("Flash bridge lifecycle with authenticated console and simulated robot", as
       await delayedPartitions;
       return new Response(partitionsOutput, { status: partitionsStatus });
     }
-    if (cmd === "status") return new Response(`uptime_s ${uptime}\ncpu_mhz 80\nbattery_pct 70\n`);
+    if (cmd === "status") {
+      return new Response(
+        `uptime_s ${uptime}\ncpu_mhz 80\nbattery_pct 70\nwifi connected\nwifi_ssid HomeNet\nwifi_ip 192.0.2.1\nwifi_channel 6\nwifi_rssi -52\nap_ssid BalaX-AP\nap_clients 1\nremote_live yes\nremote_msgs 142\nremote_failed 2\n`
+      );
+    }
+    if (cmd.startsWith("probe ")) {
+      sleepProbeCount++;
+      if (probeFails) throw new TypeError("fetch failed");
+      return new Response(
+        `power_mode wifi-sleep\npmic_c 31.5\nbattery_pct 68\nbattery_v 3.92\nusb_v ${probeUsbV.toFixed(2)}\nwifi connected\nwifi_rssi -55\nwifi_channel 6\nap_ssid BalaX-AP\nap_clients 0\nremote_live no\nremote_msgs 142\nremote_failed 2\nuptime_s ${uptime + 15}\n`
+      );
+    }
+    if (cmd === "wifi-sleep" || cmd === "wifi-sleep force" || cmd === "sleep" || cmd === "sleep force") {
+      sentPowerCmds.push(cmd);
+      return new Response("Entering wifi-sleep.\n");
+    }
+    if (cmd === "usb-sleep" || cmd === "usb-sleep force" || cmd === "off" || cmd === "off force") {
+      sentPowerCmds.push(cmd);
+      return new Response(offReply);
+    }
+    if (cmd === "wake") {
+      sentPowerCmds.push(cmd);
+      return new Response("Awake.\n");
+    }
     assert.ok(cmd === "stream" || cmd === "stream stop");
     return new Response("active no\n");
   });
@@ -166,15 +223,25 @@ test("Flash bridge lifecycle with authenticated console and simulated robot", as
   const configure = telemetryBridgePlugin().configureServer;
   assert.equal(typeof configure, "function");
   if (typeof configure !== "function") throw new Error("Missing bridge server hook");
+  const wsPayloads: unknown[] = [];
+  let serverRestarts = 0;
   configure({
     httpServer,
+    ws: { send(payload: unknown) { wsPayloads.push(payload); } },
+    async restart() { serverRestarts++; },
     middlewares: { use(handler: Middleware) { handle = handler; } },
   } as unknown as ViteDevServer);
   t.after(() => { httpServer.emit("close"); });
 
-  async function request(path: string, method = "GET", payload = "") {
+  async function request(path: string, method = "GET", payload = "", options: {
+    headers?: Record<string, string>;
+    socket?: BridgeRequest["socket"];
+  } = {}) {
     assert.ok(handle);
-    const req = Object.assign(Readable.from([payload]), { url: `/api/bridge/${path}`, method, headers: {} });
+    const req = Object.assign(Readable.from([payload]), {
+      url: `/api/bridge/${path}`, method, headers: options.headers ?? {},
+      socket: options.socket ?? { remoteAddress: "127.0.0.1", localAddress: "127.0.0.1" },
+    });
     const headers = new Headers();
     let response = "";
     const res = {
@@ -187,6 +254,22 @@ test("Flash bridge lifecycle with authenticated console and simulated robot", as
   }
   const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
   const connect = () => request("connect", "POST", '{"ip":"192.0.2.1"}');
+
+  const remoteUsb = await request("usb/info", "GET", "", {
+    headers: { host: "balax-remote.local:5180" },
+    socket: { remoteAddress: "192.0.2.1", localAddress: "192.0.2.2" },
+  });
+  assert.equal(remoteUsb.body.local, false);
+  assert.deepEqual(remoteUsb.body.ports, []);
+  assert.equal(remoteUsb.headers.get("access-control-allow-origin"), null);
+  const crossOriginUsb = await request("usb/flash", "POST", "{}", {
+    headers: { host: "localhost:5180", origin: "https://example.com" },
+  });
+  assert.equal(crossOriginUsb.statusCode, 403);
+  const unconfirmedUsb = await request("usb/flash", "POST", "{}", {
+    headers: { host: "localhost:5180", origin: "http://localhost:5180", "content-type": "application/json" },
+  });
+  assert.equal(unconfirmedUsb.statusCode, 400);
 
   const offline = await request("flash");
   assert.equal(offline.body.status, "offline");
@@ -258,11 +341,31 @@ test("Flash bridge lifecycle with authenticated console and simulated robot", as
   assert.equal(rebooted.body.status, "live");
   assert.equal((await request("trace")).body.flashRevision, rebooted.body.revision);
 
+  hasFactory = true;
+  const rejectedFactory = await request("ota", "POST");
+  assert.equal(rejectedFactory.statusCode, 502);
+  assert.match(rejectedFactory.body.error, /Factory OTA updater rejected boot selection/);
+  assert.equal(otaProcess, null);
+  enterStatus = 200;
+  const missingFactory = request("ota", "POST");
+  await settle();
+  t.mock.timers.tick(20_001);
+  assert.match((await missingFactory).body.error, /Factory OTA updater did not come online/);
+  assert.equal(otaProcess, null);
+  hasFactory = false;
+
   const ota = request("ota", "POST");
   await Promise.resolve();
   assert.equal((await request("flash")).body.status, "busy");
+  const traceDuringOta = await request("trace");
+  assert.equal(traceDuringOta.body.otaJob?.active, true);
   assert.equal((await ota).body.ok, true);
   assert.ok(otaProcess);
+  const traceAfterOta = await request("trace");
+  assert.equal(traceAfterOta.body.otaJob?.active, false);
+  assert.equal(traceAfterOta.body.otaJob?.status, "done");
+  assert.equal(traceAfterOta.body.otaJob?.progress, 100);
+  assert.equal(traceAfterOta.body.otaJob?.partition, "ota_1");
   const rebooting = await request("flash");
   assert.equal(rebooting.body.status, "offline");
   assert.ok(rebooting.body.revision > rebooted.body.revision);
@@ -284,4 +387,166 @@ test("Flash bridge lifecycle with authenticated console and simulated robot", as
   await settle();
   assert.equal((await request("flash")).body.status, "live");
   assert.equal(partitionReads, beforeRecovery + 1);
+
+  // Power mode: Wi-Fi sleep pauses bridge polling without waking the robot.
+  const sleepRes = await request("power", "POST", JSON.stringify({ mode: "wifi-sleep", via: "lan" }));
+  assert.equal(sleepRes.statusCode, 200);
+  assert.equal(sleepRes.body.powerMode, "wifi-sleep");
+  assert.equal((await request("trace")).body.powerMode, "wifi-sleep");
+  assert.equal((await request("trace")).body.connected, false);
+  const readsWhileAsleep = streamReads;
+  t.mock.timers.tick(2000);
+  await settle();
+  assert.equal(streamReads, readsWhileAsleep);
+
+  // Wake over Wi-Fi resumes polling and reconnects.
+  const wakeRes = await request("power", "POST", JSON.stringify({ mode: "wake", via: "lan" }));
+  assert.equal(wakeRes.statusCode, 200);
+  assert.equal(wakeRes.body.powerMode, "awake");
+  assert.equal((await request("trace")).body.connected, true);
+
+  // Anti-wake: robot self-sleeping (X-Power-Mode: sleep header) pauses bridge immediately.
+  streamPowerHeader = "wifi-sleep";
+  t.mock.timers.tick(100);
+  await settle();
+  assert.equal((await request("trace")).body.powerMode, "wifi-sleep");
+  assert.equal((await request("trace")).body.connected, false);
+  const readsAfterSelfSleep = streamReads;
+  t.mock.timers.tick(2000);
+  await settle();
+  assert.equal(streamReads, readsAfterSelfSleep);
+  streamPowerHeader = null;
+
+  // During wifi-sleep, slow passive probe updates health on a 15s cadence without calling /api/stream.
+  const probesBeforeSleepTick = sleepProbeCount;
+  t.mock.timers.tick(2000);
+  await settle();
+  assert.equal(sleepProbeCount, probesBeforeSleepTick, "Passive sleep probe should stay quiet inside 15s interval");
+  t.mock.timers.tick(15_500);
+  await settle();
+  await settle();
+  assert.ok(sleepProbeCount > probesBeforeSleepTick, "Expected passive sleep probe to run after 15s interval");
+  assert.equal(streamReads, readsAfterSelfSleep, "Passive sleep probe must not touch /api/stream");
+  const sleepTrace = await request("trace");
+  assert.equal(sleepTrace.body.powerMode, "wifi-sleep");
+  assert.equal(sleepTrace.body.connected, false);
+  assert.equal(sleepTrace.body.health?.batteryPct, 68);
+  assert.equal(sleepTrace.body.health?.pmicC, 31.5);
+
+  // /api/bridge/comms reports full mesh topology passively while in wifi-sleep without waking robot.
+  const sleepComms = await request("comms");
+  assert.equal(sleepComms.statusCode, 200);
+  assert.equal(sleepComms.body.bridge.mdnsHost, "balax-remote.local");
+  assert.equal(sleepComms.body.robot.powerMode, "wifi-sleep");
+  assert.equal(sleepComms.body.health?.apSsid, "BalaX-AP");
+  assert.equal(sleepComms.body.health?.remoteLive, false);
+  assert.equal(sleepComms.body.health?.remoteMsgs, 142);
+  assert.equal(sleepComms.body.health?.remoteFailed, 2);
+  assert.equal(streamReads, readsAfterSelfSleep, "/api/bridge/comms must not wake sleeping robot");
+
+  // Missed Wi-Fi sleep probes while StickC had usb_v = 0.00 (e.g. only ESP32-CAM on USB)
+  // must NEVER falsely claim usb-sleep; after 3 misses StickC becomes offline ("unknown").
+  devSerialNames = ["cu.usbserial-mock-stickc", "ttyUSB0"];
+  probeFails = true;
+  t.mock.timers.tick(2_001); // past the bridge's 2 s USB port cache
+  const firstMissedNoUsbV = await request("comms?refresh=1");
+  assert.equal(firstMissedNoUsbV.statusCode, 200);
+  assert.equal(firstMissedNoUsbV.body.robot.powerMode, "wifi-sleep");
+  const secondMissedNoUsbV = await request("comms?refresh=1");
+  assert.equal(secondMissedNoUsbV.statusCode, 200);
+  assert.equal(secondMissedNoUsbV.body.robot.powerMode, "wifi-sleep");
+  const thirdMissedNoUsbV = await request("comms?refresh=1");
+  assert.equal(thirdMissedNoUsbV.statusCode, 200);
+  assert.equal(thirdMissedNoUsbV.body.robot.powerMode, "unknown");
+
+  // Re-enter wifi-sleep with StickC reporting 5.00 V USB power; 2 missed probes with
+  // a StickC USB port present validly infer usb-sleep, and unplugging USB clears it.
+  probeFails = false;
+  probeUsbV = 5.0;
+  const reSleep = await request("power", "POST", JSON.stringify({ mode: "wifi-sleep", localOnly: true }), { headers: { host: "localhost:5180" } });
+  assert.equal(reSleep.statusCode, 200);
+  await request("comms?refresh=1"); // records usb_v = 5.00 in health
+  probeFails = true;
+  const firstMissedUsbV = await request("comms?refresh=1");
+  assert.equal(firstMissedUsbV.body.robot.powerMode, "wifi-sleep");
+  const secondMissedUsbV = await request("comms?refresh=1");
+  assert.equal(secondMissedUsbV.body.robot.powerMode, "usb-sleep");
+  devSerialNames = [];
+  t.mock.timers.tick(2_001);
+  const afterUsbUnplug = await request("comms");
+  assert.equal(afterUsbUnplug.body.robot.powerMode, "unknown");
+  probeFails = false;
+  probeUsbV = 0.0;
+
+  // Wake again, verify /api/bridge/drive routes to authenticated /api/drive, then test USB-off refusal (409) vs acceptance (200).
+  await request("power", "POST", JSON.stringify({ mode: "wake", via: "lan" }));
+  const driveRes = await request("drive", "POST", JSON.stringify({ forward: 0.65, turn: -0.25 }));
+  assert.equal(driveRes.statusCode, 200);
+  assert.equal(driveRes.body.ok, true);
+  assert.equal(sentDriveBodies.at(-1), "0.650 -0.250");
+
+  // Awake /api/bridge/comms?refresh=1 parses full Wi-Fi + ESP-NOW + SoftAP + lastDrive mesh status.
+  const awakeComms = await request("comms?refresh=1");
+  assert.equal(awakeComms.statusCode, 200);
+  assert.equal(awakeComms.body.robot.connected, true);
+  assert.equal(awakeComms.body.health?.wifiPhase, "connected");
+  assert.equal(awakeComms.body.health?.apClients, 1);
+  assert.equal(awakeComms.body.health?.remoteLive, true);
+  assert.equal(awakeComms.body.lastDrive?.forward, 0.65);
+  offReply = "Refusing off: USB not connected (0.00V < 4.0V). Use 'sleep' for Wi-Fi.\n";
+  const refusedOff = await request("power", "POST", JSON.stringify({ mode: "off", via: "lan" }));
+  assert.equal(refusedOff.statusCode, 409);
+  assert.match(refusedOff.body.error, /Refusing off/);
+
+  offReply = "Entering USB-charge off (deep sleep; reboot via USB RTS->EN).\n";
+  const acceptedOff = await request("power", "POST", JSON.stringify({ mode: "usb-sleep", via: "lan" }));
+  assert.equal(acceptedOff.statusCode, 200);
+  assert.equal(acceptedOff.body.powerMode, "usb-sleep");
+  assert.equal((await request("trace")).body.powerMode, "usb-sleep");
+
+  // Local-only CLI sync pauses bridge without contacting robot; remote origin rejected.
+  const cmdsBeforeSync = sentPowerCmds.length;
+  const syncOk = await request("power", "POST", JSON.stringify({ mode: "sleep", localOnly: true }), {
+    headers: { host: "localhost:5180" },
+  });
+  assert.equal(syncOk.statusCode, 200);
+  assert.equal(sentPowerCmds.length, cmdsBeforeSync);
+  const syncRemote = await request("power", "POST", JSON.stringify({ mode: "sleep", localOnly: true }), {
+    headers: { host: "localhost:5180" },
+    socket: { remoteAddress: "192.0.2.99", localAddress: "192.0.2.1" },
+  });
+  assert.equal(syncRemote.statusCode, 403);
+
+  // Cross-origin USB wake request is rejected with 403.
+  const crossOriginUsbPower = await request("power", "POST", JSON.stringify({ mode: "wake", via: "usb" }), {
+    headers: { host: "localhost:5180", origin: "http://evil.example", "sec-fetch-site": "cross-site" },
+  });
+  assert.equal(crossOriginUsbPower.statusCode, 403);
+
+  // Already-booted factory stub should upload without calling /api/cmd (which stub doesn't serve).
+  isStub = true;
+  const stubOta = await request("ota", "POST");
+  assert.equal(stubOta.statusCode, 200);
+  assert.equal(stubOta.body.ok, true);
+  isStub = false;
+
+  // Forced page reload and in-process Vite server restart (local only).
+  const reloadRes = await request("reload", "POST", "{}", { headers: { host: "localhost:5180" } });
+  assert.equal(reloadRes.statusCode, 200);
+  assert.equal(reloadRes.body.action, "full-reload");
+  assert.deepEqual(wsPayloads.at(-1), { type: "full-reload", path: "*" });
+
+  const restartRes = await request("reload", "POST", JSON.stringify({ restart: true }), {
+    headers: { host: "localhost:5180" },
+  });
+  assert.equal(restartRes.statusCode, 200);
+  assert.equal(restartRes.body.action, "restart");
+  t.mock.timers.tick(60);
+  assert.equal(serverRestarts, 1);
+
+  const remoteReload = await request("reload", "POST", "{}", {
+    headers: { host: "localhost:5180" },
+    socket: { remoteAddress: "192.0.2.99", localAddress: "192.0.2.1" },
+  });
+  assert.equal(remoteReload.statusCode, 403);
 });

@@ -1,8 +1,7 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import {
   ActiveImuCalibration,
   CameraInputSettings,
-  computeStickVector,
   createDefaultBalaXGains,
   DEFAULT_IMU_CALIBRATION,
   GainParam,
@@ -29,11 +28,33 @@ import "@g-ai/3d-ui/windowing.css";
 import "@g-ai/3d-ui/log.css";
 import { BalaXBabylonScene } from "./BalaXBabylonScene";
 import { CalibrationHilPanel } from "./CalibrationHilPanel";
+import { CommunicationsPanel } from "./CommunicationsPanel";
+import { ControlLabPanel } from "./ControlLabPanel";
+import { DualMotorDrivePad, type DriveStickCommand } from "./DualMotorDrivePad";
 import { OtaPanel } from "./OtaPanel";
 import { ProgramsPanel } from "./ProgramsPanel";
-import { CpuPanel, FlashPanel, RamPanel, RobotHealth, SystemSnapshot } from "./SystemMonitorPanels";
+import { FpvCamPanel } from "./FpvCamPanel";
+import { useCameraSetting, useCameraStatus } from "./cameraStatus";
+import { detectRuntimeMode, getRuntimeMode, hasWebSerial, subscribeRuntimeMode } from "./runtimeMode";
+import { webSerialCam } from "./webSerialCam";
+import { webSerialStickC, type WebSerialStickCState } from "./webSerialStickC";
+import { CAMERA_SETTING, DEFAULT_CAMERA_HOST, type CameraTransport } from "./cameraSettings";
+import { DeviceControlGroup } from "./DeviceControlGroup";
+import {
+  resolveCamComm,
+  resolveCamStateDisplay,
+  resolveStickCComm,
+  resolveStickCStateDisplay,
+  type CamCommChoice,
+  type CamStateChoice,
+  type StickCCommChoice,
+  type StickCStateChoice,
+} from "./deviceControls";
+import { CameraSystemMonitor, CpuPanel, FlashPanel, RamPanel, RobotHealth, SystemSnapshot } from "./SystemMonitorPanels";
 import type { FlashSnapshot } from "./flashProtocol";
+import type { OtaJobSnapshot } from "./otaProtocol";
 import { TraceSample } from "./bxz1";
+import { migrateWorkspaceV9 } from "./workspaceMigration";
 
 interface StreamMetrics {
   targetHz: number;
@@ -48,15 +69,22 @@ interface StreamMetrics {
   healthIntervalMs: number;
 }
 
+type PowerModeState = "awake" | "wifi-sleep" | "usb-sleep" | "unknown";
+
 interface BridgeTraceResponse {
   robotIp: string;
   connected: boolean;
+  powerMode?: PowerModeState;
+  usbAvailable?: boolean;
+  usbPort?: string | null;
   telemetryAvailable?: boolean;
   lastAckTick: number;
   flashRevision?: number;
   totalSamplesReceived: number;
   totalBytesCompressed: number;
   health?: RobotHealth | null;
+  otaJob?: OtaJobSnapshot | null;
+  lastDrive?: { forward: number; turn: number; atMs: number } | null;
   streamMetrics?: StreamMetrics | null;
   samples: TraceSample[];
 }
@@ -76,12 +104,15 @@ const IMU_WARN_C = 52;
 const IMU_HOT_C = 58;
 const BATTERY_LOW_PCT = 30;
 
-type BalaXTabId = "telemetry" | "calibrate" | "camera" | "cpu" | "ram" | "flash" | "ota" | "programs" | "tuning" | "console";
+type BalaXTabId = "telemetry" | "control" | "comms" | "calibrate" | "camera" | "view3d" | "cpu" | "ram" | "flash" | "ota" | "programs" | "tuning" | "console";
 
 const TAB_DEFINITIONS: readonly WindowTabDefinition<BalaXTabId>[] = [
   { id: "telemetry", label: "Telemetry" },
+  { id: "control", label: "Control" },
+  { id: "comms", label: "Network" },
   { id: "calibrate", label: "Calibrate & HIL" },
   { id: "camera", label: "Camera" },
+  { id: "view3d", label: "3D View" },
   { id: "cpu", label: "CPU" },
   { id: "ram", label: "RAM" },
   { id: "flash", label: "Flash" },
@@ -91,7 +122,8 @@ const TAB_DEFINITIONS: readonly WindowTabDefinition<BalaXTabId>[] = [
   { id: "console", label: "Console & Log" },
 ];
 
-const WORKSPACE_STORAGE_KEY = "balax.window-workspace.v6";
+const WORKSPACE_STORAGE_KEY = "balax.window-workspace.v10";
+const LEGACY_WORKSPACE_STORAGE_KEY = "balax.window-workspace.v9";
 const RESTORABLE_TABS = new Set(TAB_DEFINITIONS.map(({ id }) => id));
 const OVERLAY_CONTEXT = {
   active: false,
@@ -101,11 +133,13 @@ const OVERLAY_CONTEXT = {
   entryTabId: "telemetry" as const,
 };
 const DEFAULT_WORKSPACE = JSON.stringify(createWindowWorkspaceState<BalaXTabId>({
-  primary: { tabs: ["telemetry", "calibrate", "camera"], width: 450, height: 440 },
-  secondary: { tabs: ["cpu", "ram", "flash", "ota", "programs", "tuning", "console"], width: 420, height: 380 },
+  primary: { tabs: ["telemetry", "control", "camera", "calibrate", "view3d"], width: 450, height: 480 },
+  secondary: { tabs: ["comms", "cpu", "ram", "flash", "ota", "programs", "tuning", "console"], width: 440, height: 420 },
 }));
 const WORKSPACE_STORAGE = {
-  getItem: () => window.localStorage.getItem(WORKSPACE_STORAGE_KEY) ?? DEFAULT_WORKSPACE,
+  getItem: () => window.localStorage.getItem(WORKSPACE_STORAGE_KEY)
+    ?? migrateWorkspaceV9(window.localStorage.getItem(LEGACY_WORKSPACE_STORAGE_KEY))
+    ?? DEFAULT_WORKSPACE,
   setItem: (_key: string, value: string) => window.localStorage.setItem(WORKSPACE_STORAGE_KEY, value),
 };
 
@@ -130,8 +164,18 @@ const RAD_TO_DEG = 180 / Math.PI;
 export default function App() {
   const [targetHost, setTargetHost] = useState("balax.local");
   const [connected, setConnected] = useState(false);
+  const [powerMode, setPowerMode] = useState<PowerModeState>("unknown");
+  const [usbAvailable, setUsbAvailable] = useState(false);
+  const [usbPort, setUsbPort] = useState<string | null>(null);
+  const [stickCCommChoice, setStickCCommChoice] = useState<StickCCommChoice>("auto");
+  const [stickCForcedState, setStickCForcedState] = useState<StickCStateChoice>("auto");
+  const [powerBusy, setPowerBusy] = useState(false);
+  const [camForcedState, setCamForcedState] = useState<CamStateChoice>("auto");
+  const [camBusy, setCamBusy] = useState(false);
   const [telemetryAvailable, setTelemetryAvailable] = useState(false);
   const [health, setHealth] = useState<RobotHealth | null>(null);
+  const [otaJob, setOtaJob] = useState<OtaJobSnapshot | null>(null);
+  const otaJobRef = useRef<OtaJobSnapshot | null>(null);
   const [streamMetrics, setStreamMetrics] = useState<StreamMetrics | null>(null);
   const [targetHz, setTargetHz] = useState<number>(20);
   const targetHzRef = useRef<number>(20);
@@ -147,8 +191,10 @@ export default function App() {
   const [kinematics, setKinematics] = useState<RobotKinematicState | null>(null);
   const [totalSamples, setTotalSamples] = useState(0);
   const [totalBytes, setTotalBytes] = useState(0);
-  const [stick, setStick] = useState({ x: 0, y: 0 });
-  const [origin, setOrigin] = useState<{ x: number; y: number } | null>(null);
+  const driveCmdRef = useRef<DriveStickCommand>({ forward: 0, turn: 0 });
+  const [remoteStick, setRemoteStick] = useState<DriveStickCommand | null>(null);
+  const lastDriveSentMsRef = useRef(0);
+  const driveKeepaliveRef = useRef<number | null>(null);
   const [gains, setGains] = useState<GainParam[]>(() => [
     { name: "brightness", value: 50, min: 0, max: 100 },
     { name: "volume", value: 60, min: 0, max: 100 },
@@ -180,6 +226,9 @@ export default function App() {
   const thermalLevelRef = useRef<"ok" | "warm" | "hot">("ok");
   const batteryLineRef = useRef<GameLogLine | null>(null);
   const prevConnectedRef = useRef<boolean | null>(null);
+  const otaLineRef = useRef<GameLogLine | null>(null);
+  const otaLineJobIdRef = useRef<string | null>(null);
+  const otaTerminalLoggedRef = useRef<string | null>(null);
   const controlsRef = useRef<HTMLDivElement | null>(null);
   const appRef = useRef<HTMLDivElement | null>(null);
   const [logSize] = useState(createLogSizePort);
@@ -190,10 +239,25 @@ export default function App() {
   const flashVisible = tabVisibility.flash === true;
   const systemVisible = tabVisibility.cpu === true || tabVisibility.ram === true;
   const onTabVisibility = useCallback((tab: BalaXTabId, visible: boolean) => {
-    if (tab === "flash" || tab === "cpu" || tab === "ram" || tab === "telemetry") {
+    if (tab === "camera" || tab === "flash" || tab === "cpu" || tab === "ram" || tab === "telemetry" || tab === "comms") {
       setTabVisibility((current) => current[tab] === visible ? current : { ...current, [tab]: visible });
     }
   }, []);
+  const onCameraNotice = useCallback((text: string, tone: "info" | "warning" | "error" = "info") => {
+    gameLog.print({ text, tone });
+  }, [gameLog]);
+  const runtimeMode = useSyncExternalStore(subscribeRuntimeMode, getRuntimeMode);
+  const [stickCSerial, setStickCSerial] = useState<WebSerialStickCState>(() => webSerialStickC.getState());
+  useEffect(() => {
+    void detectRuntimeMode();
+    return webSerialStickC.subscribe(setStickCSerial);
+  }, []);
+  const camera = useCameraStatus(tabVisibility.camera === true || systemVisible || flashVisible, onCameraNotice);
+  const camTransport = useCameraSetting<CameraTransport>(camera.settings, CAMERA_SETTING.transport);
+  const camHostValue = useCameraSetting<string>(camera.settings, CAMERA_SETTING.host);
+  const cameraStatus = camera.status?.powerMode === "sleep"
+    || (camera.receivedAtMs != null && Date.now() - camera.receivedAtMs < 10500)
+    ? camera.status : null;
 
   useEffect(() => {
     const controls = controlsRef.current;
@@ -223,6 +287,7 @@ export default function App() {
     const clamped = Math.max(1, Math.min(50, Math.round(nextHz)));
     setTargetHz(clamped);
     targetHzRef.current = clamped;
+    if (getRuntimeMode() === "standalone") return;
     pendingRate.current = clamped;
     if (rateRequestActive.current) return;
     rateRequestActive.current = true;
@@ -252,9 +317,12 @@ export default function App() {
   };
 
   useEffect(() => {
+    if (runtimeMode === "standalone") return;
     let active = true;
     let timer: number | null = null;
     const poll = async () => {
+      const mode = await detectRuntimeMode();
+      if (!active || mode !== "bridge") return;
       const t0 = performance.now();
       const rateAtStart = rateRevision.current;
       try {
@@ -266,13 +334,20 @@ export default function App() {
         if (!active) return;
 
         setConnected(data.connected);
+        if (data.powerMode) setPowerMode(data.powerMode);
+        if (typeof data.usbAvailable === "boolean") setUsbAvailable(data.usbAvailable);
+        if (data.usbPort !== undefined) setUsbPort(data.usbPort ?? null);
         const canStream = data.connected && (data.telemetryAvailable ?? true);
         setTelemetryAvailable(canStream);
         setFlashRevision(data.flashRevision ?? null);
         const sessionChanged = data.flashRevision != null && lastTraceFlashRevision.current != null
           && data.flashRevision !== lastTraceFlashRevision.current;
         lastTraceFlashRevision.current = data.flashRevision ?? null;
-        setHealth(data.connected ? (data.health ?? null) : null);
+        setHealth((data.connected || data.powerMode === "wifi-sleep") ? (data.health ?? null) : null);
+        const nextOta = data.otaJob ?? null;
+        otaJobRef.current = nextOta;
+        setOtaJob(nextOta);
+        setRemoteStick(data.connected && data.lastDrive ? { forward: data.lastDrive.forward, turn: data.lastDrive.turn } : null);
         if (data.streamMetrics) {
           setStreamMetrics(data.streamMetrics);
           if (!rateRequestActive.current && rateAtStart === rateRevision.current) {
@@ -326,10 +401,10 @@ export default function App() {
       active = false;
       if (timer !== null) window.clearTimeout(timer);
     };
-  }, []);
+  }, [runtimeMode]);
 
   useEffect(() => {
-    if (!connected) {
+    if (!connected || runtimeMode !== "bridge") {
       lastFlashRequest.current = null;
       setFlashSnapshot(null);
       return;
@@ -360,12 +435,12 @@ export default function App() {
       }
     })();
     return () => request.abort();
-  }, [connected, flashRevision, flashVisible, flashRefresh]);
+  }, [connected, flashRevision, flashVisible, flashRefresh, runtimeMode]);
 
   // Poll CPU and RAM monitor history independently of the on-demand flash command.
   useEffect(() => {
     setSystemSnap(null);
-    if (!connected || !systemVisible) return;
+    if (!connected || !systemVisible || runtimeMode !== "bridge") return;
     let active = true;
     const pollSys = async () => {
       try {
@@ -383,7 +458,7 @@ export default function App() {
       active = false;
       clearInterval(timer);
     };
-  }, [connected, flashRevision, systemVisible]);
+  }, [connected, flashRevision, systemVisible, runtimeMode]);
 
   // Draw 100 Hz telemetry strip chart (Pitch, Rate, Motor power)
   useEffect(() => {
@@ -430,8 +505,82 @@ export default function App() {
     drawSeries("#d29922", (s) => s.pitchDps, 250); // Pitch rate (deg/s)
   }, [latest, tabVisibility.telemetry]);
 
+  const postDriveCommand = useCallback(async (cmd: DriveStickCommand) => {
+    if (getRuntimeMode() !== "bridge") return;
+    try {
+      await fetch("/api/bridge/drive", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(cmd),
+      });
+    } catch {
+      // ignore transient LAN hiccups during continuous driving
+    }
+  }, []);
+
+  const handleDriveStickChange = useCallback(
+    (cmd: DriveStickCommand) => {
+      driveCmdRef.current = cmd;
+      const isZero = Math.abs(cmd.forward) < 0.001 && Math.abs(cmd.turn) < 0.001;
+      const now = performance.now();
+      if (isZero) {
+        if (driveKeepaliveRef.current !== null) {
+          window.clearInterval(driveKeepaliveRef.current);
+          driveKeepaliveRef.current = null;
+        }
+        lastDriveSentMsRef.current = now;
+        if (connected) void postDriveCommand({ forward: 0, turn: 0 });
+        return;
+      }
+      if (!connected) return;
+      if (now - lastDriveSentMsRef.current >= 45) {
+        lastDriveSentMsRef.current = now;
+        void postDriveCommand(cmd);
+      }
+      if (driveKeepaliveRef.current === null) {
+        driveKeepaliveRef.current = window.setInterval(() => {
+          const cur = driveCmdRef.current;
+          if (Math.abs(cur.forward) < 0.001 && Math.abs(cur.turn) < 0.001) {
+            if (driveKeepaliveRef.current !== null) {
+              window.clearInterval(driveKeepaliveRef.current);
+              driveKeepaliveRef.current = null;
+            }
+            return;
+          }
+          lastDriveSentMsRef.current = performance.now();
+          void postDriveCommand(cur);
+        }, 60);
+      }
+    },
+    [connected, postDriveCommand]
+  );
+
+  useEffect(() => {
+    if (!connected && driveKeepaliveRef.current !== null) {
+      window.clearInterval(driveKeepaliveRef.current);
+      driveKeepaliveRef.current = null;
+      driveCmdRef.current = { forward: 0, turn: 0 };
+    }
+    return () => {
+      if (driveKeepaliveRef.current !== null) {
+        window.clearInterval(driveKeepaliveRef.current);
+        driveKeepaliveRef.current = null;
+      }
+    };
+  }, [connected]);
+
   async function sendRobotCommand(cmd: string): Promise<string> {
     try {
+      if (webSerialStickC.isConnected()) {
+        const text = (await webSerialStickC.sendCommand(cmd)).trim();
+        setCmdOutput(text || "(ok)");
+        return text;
+      }
+      if (getRuntimeMode() === "standalone") {
+        const msg = "Connect StickC over USB (Web Serial) or run the local bridge for Wi-Fi LAN.";
+        setCmdOutput(msg);
+        return msg;
+      }
       const res = await fetch("/api/bridge/cmd", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -553,6 +702,12 @@ export default function App() {
   }
 
   async function connectWifi() {
+    if (getRuntimeMode() === "standalone") {
+      const msg = "Standalone GitHub Pages mode uses browser Web Serial (USB). Run `npm run dev` locally for Wi-Fi LAN bridge.";
+      setCmdOutput(msg);
+      gameLog.print({ text: msg, tone: "info" });
+      return;
+    }
     lastSeenTickRef.current = 0;
     historyRef.current = [];
     setLatest(null);
@@ -571,6 +726,13 @@ export default function App() {
   }
 
   async function disconnectWifi() {
+    if (webSerialStickC.isConnected()) {
+      await webSerialStickC.disconnect();
+      setCmdOutput("Disconnected StickC USB (Web Serial).");
+      gameLog.print({ text: "Disconnected StickC USB (Web Serial).", tone: "info" });
+      if (getRuntimeMode() === "standalone") return;
+    }
+    if (getRuntimeMode() === "standalone") return;
     try {
       const res = await fetch("/api/bridge/disconnect", { method: "POST" });
       if (!res.ok) throw new Error(`Disconnect failed (HTTP ${res.status}).`);
@@ -592,7 +754,275 @@ export default function App() {
     gameLog.print({ text: "Display brightness set to 0% (LCD off)", tone: "info" });
   }
 
+  async function setRobotPower(mode: "wifi-sleep" | "usb-sleep" | "wake", via: "lan" | "usb" = "lan") {
+    if (powerBusy) return;
+    setPowerBusy(true);
+    try {
+      if (webSerialStickC.isConnected() || getRuntimeMode() === "standalone") {
+        if (mode === "wake") {
+          const msg = await webSerialStickC.wake();
+          setPowerMode("awake");
+          setCmdOutput(msg);
+          gameLog.print({ text: msg, tone: "info" });
+          return;
+        }
+        if (!webSerialStickC.isConnected()) {
+          await webSerialStickC.connect();
+        }
+        const out = await webSerialStickC.sendCommand(mode === "usb-sleep" ? "usb-sleep" : "sleep");
+        setPowerMode(mode);
+        const summary = mode === "usb-sleep"
+          ? "BalaX entered usb-sleep over Web Serial"
+          : "BalaX entered wifi-sleep over Web Serial";
+        setCmdOutput(out || summary);
+        gameLog.print({ text: summary, tone: "info" });
+        return;
+      }
+      const res = await fetch("/api/bridge/power", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode, via }),
+      });
+      const data = (await res.json()) as { ok?: boolean; powerMode?: PowerModeState; output?: string; error?: string };
+      if (!res.ok || !data.ok) {
+        const msg = data.error ?? `Power ${mode} failed (HTTP ${res.status}).`;
+        setCmdOutput(msg);
+        gameLog.print({ text: msg, tone: "error" });
+        return;
+      }
+      if (data.powerMode) setPowerMode(data.powerMode);
+      if (mode === "wifi-sleep" || mode === "usb-sleep") {
+        setConnected(false);
+        setTelemetryAvailable(false);
+        setHealth(null);
+        setLatest(null);
+      }
+      const summary =
+        mode === "wifi-sleep"
+          ? "BalaX entered wifi-sleep (faint 4s LED pulse; bridge paused)"
+          : mode === "usb-sleep"
+            ? "BalaX entered usb-sleep (ultra-dim 10s LED; auto-switches to wifi-sleep on unplug)"
+            : via === "usb"
+              ? "Pulsed USB reset — BalaX is waking..."
+              : "Waking BalaX over Wi-Fi...";
+      setCmdOutput(data.output || summary);
+      gameLog.print({ text: summary, tone: "info" });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setCmdOutput(msg);
+      gameLog.print({ text: msg, tone: "error" });
+    } finally {
+      setPowerBusy(false);
+    }
+  }
+
+  async function handleStickCCommSelect(next: StickCCommChoice) {
+    setStickCCommChoice(next);
+    if (next === "usb" && (getRuntimeMode() === "standalone" || !usbAvailable) && !webSerialStickC.isConnected()) {
+      if (!hasWebSerial()) {
+        gameLog.print({ text: "Browser Web Serial requires Chrome or Edge over HTTPS/localhost.", tone: "warning" });
+        return;
+      }
+      setPowerBusy(true);
+      try {
+        const st = await webSerialStickC.connect();
+        gameLog.print({ text: `Connected StickC USB (${st.portLabel ?? "Web Serial"}).`, tone: "info" });
+      } catch (err) {
+        gameLog.print({ text: `StickC USB: ${err instanceof Error ? err.message : String(err)}`, tone: "error" });
+      } finally {
+        setPowerBusy(false);
+      }
+    } else if (next === "wifi" && getRuntimeMode() === "standalone") {
+      gameLog.print({ text: "Wi-Fi LAN bridge requires local `npm run dev`. Use USB (Web Serial) on GitHub Pages.", tone: "info" });
+    }
+  }
+
+  async function handleStickCStateSelect(next: StickCStateChoice, activeComm: "wifi" | "usb") {
+    setStickCForcedState(next);
+    if (next === "auto") return;
+    if (getRuntimeMode() === "standalone" || webSerialStickC.isConnected()) {
+      if (next === "awake") {
+        if (!webSerialStickC.isConnected()) {
+          setPowerBusy(true);
+          try {
+            const st = await webSerialStickC.connect();
+            gameLog.print({ text: `Connected StickC USB (${st.portLabel ?? "Web Serial"}).`, tone: "info" });
+          } catch (err) {
+            gameLog.print({ text: `StickC USB: ${err instanceof Error ? err.message : String(err)}`, tone: "error" });
+          } finally {
+            setPowerBusy(false);
+          }
+        } else {
+          await setRobotPower("wake", "usb");
+        }
+        return;
+      }
+      if (next === "wifi-sleep" || next === "usb-sleep") {
+        await setRobotPower(next, "usb");
+        return;
+      }
+      await disconnectWifi();
+      return;
+    }
+    if (next === "awake") {
+      if (connected) return;
+      if (powerMode === "wifi-sleep" && activeComm !== "usb") {
+        await setRobotPower("wake", "lan");
+      } else if (activeComm === "usb" && usbAvailable) {
+        await setRobotPower("wake", "usb");
+      } else {
+        await connectWifi();
+      }
+      return;
+    }
+    if (next === "wifi-sleep") {
+      await setRobotPower("wifi-sleep", "lan");
+      return;
+    }
+    if (next === "usb-sleep") {
+      await setRobotPower("usb-sleep", connected ? "lan" : "usb");
+      return;
+    }
+    await disconnectWifi();
+  }
+
+  async function postCamBridge<T extends { ok?: boolean; message?: string; error?: string }>(
+    action: string,
+    payload: Record<string, unknown> = {},
+  ): Promise<T> {
+    const query = new URLSearchParams({ host: camera.host });
+    const res = await fetch(`/api/bridge/cam/${action}?${query}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = (await res.json()) as T;
+    if (!res.ok || data.ok === false) {
+      throw new Error(data.error ?? data.message ?? `Camera bridge returned HTTP ${res.status}`);
+    }
+    return data;
+  }
+
+  async function handleCamCommSelect(next: CamCommChoice) {
+    camera.settings.set(CAMERA_SETTING.transport, next);
+    if (camBusy) return;
+    setCamBusy(true);
+    try {
+      const standalone = getRuntimeMode() === "standalone";
+      if (standalone || (next === "usb" && !cameraStatus?.usbPort && !camera.directUsbConnected)) {
+        if (next === "usb" || (next === "auto" && standalone)) {
+          if (!webSerialCam.isConnected()) {
+            await camera.connectDirectUsb();
+          }
+        } else if (standalone) {
+          gameLog.print({
+            text: "Wi-Fi UDP/HTTP stream requires the local dev bridge (`npm run dev`). Use USB (Web Serial) on GitHub Pages.",
+            tone: "info",
+          });
+        }
+        return;
+      }
+      if (next !== "usb" && camera.directUsbConnected) {
+        await camera.disconnectDirectUsb();
+      }
+      await postCamBridge("transport", { transport: next });
+      await camera.fetchStatus(false);
+    } catch (err) {
+      gameLog.print({
+        text: `ESP32-CAM transport: ${err instanceof Error ? err.message : String(err)}`,
+        tone: "error",
+      });
+    } finally {
+      setCamBusy(false);
+    }
+  }
+
+  async function handleCamStateSelect(next: CamStateChoice) {
+    setCamForcedState(next);
+    if (next === "auto") return;
+    if (camBusy) return;
+    setCamBusy(true);
+    try {
+      if (camera.directUsbConnected || getRuntimeMode() === "standalone") {
+        if (!webSerialCam.isConnected() && next !== "sleep") {
+          await camera.connectDirectUsb();
+        }
+        if (next === "streaming") {
+          if (cameraStatus?.powerMode === "sleep") {
+            const wakeRes = await webSerialCam.setPower("wake");
+            if (wakeRes.message) gameLog.print({ text: wakeRes.message, tone: "info" });
+          }
+          await webSerialCam.startStream();
+          camera.setStreaming(true);
+        } else if (next === "idle") {
+          const res = await webSerialCam.setPower("idle");
+          camera.setStreaming(false);
+          gameLog.print({ text: res.message || "ESP32-CAM switched to Cool Idle.", tone: "info" });
+        } else if (next === "sleep") {
+          const res = await webSerialCam.setPower("sleep");
+          camera.setStreaming(false);
+          gameLog.print({ text: res.message || "ESP32-CAM entered Deep Sleep.", tone: "info" });
+        }
+        return;
+      }
+      const via = camTransport === "usb" ? "usb" : "auto";
+      if (next === "streaming") {
+        if (cameraStatus?.powerMode === "sleep") {
+          const wakeRes = await postCamBridge("power", { mode: "wake", via });
+          if (wakeRes.message) gameLog.print({ text: wakeRes.message, tone: "info" });
+        }
+        await postCamBridge("start", { transport: camTransport });
+        camera.setStreaming(true);
+        await camera.fetchStatus(false);
+      } else if (next === "idle") {
+        const res = await postCamBridge("power", { mode: "idle", via });
+        camera.setStreaming(false);
+        gameLog.print({ text: res.message ?? "ESP32-CAM switched to Cool Idle.", tone: "info" });
+        await camera.fetchStatus(false);
+      } else if (next === "sleep") {
+        const res = await postCamBridge("power", { mode: "sleep", via });
+        camera.setStreaming(false);
+        gameLog.print({ text: res.message ?? "ESP32-CAM entered Deep Sleep.", tone: "info" });
+        await camera.fetchStatus(false);
+      }
+    } catch (err) {
+      gameLog.print({
+        text: `ESP32-CAM state: ${err instanceof Error ? err.message : String(err)}`,
+        tone: "error",
+      });
+    } finally {
+      setCamBusy(false);
+    }
+  }
+
+  async function handleCamWake() {
+    if (camBusy) return;
+    setCamBusy(true);
+    try {
+      if (camera.directUsbConnected || getRuntimeMode() === "standalone") {
+        const res = await webSerialCam.setPower("wake");
+        gameLog.print({ text: res.message || "Waking ESP32-CAM via Web Serial…", tone: "info" });
+        return;
+      }
+      const via = camTransport === "usb" ? "usb" : "auto";
+      const res = await postCamBridge("power", { mode: "wake", via });
+      gameLog.print({ text: res.message ?? "Waking ESP32-CAM…", tone: "info" });
+      await camera.fetchStatus(true);
+    } catch (err) {
+      gameLog.print({
+        text: `ESP32-CAM wake: ${err instanceof Error ? err.message : String(err)}`,
+        tone: "error",
+      });
+    } finally {
+      setCamBusy(false);
+    }
+  }
+
   function downloadSessionCsv() {
+    if (getRuntimeMode() !== "bridge") {
+      gameLog.print({ text: "CSV session export requires live telemetry via the local bridge.", tone: "info" });
+      return;
+    }
     window.open("/api/bridge/trace?limit=10000&format=csv", "_blank");
   }
 
@@ -634,13 +1064,53 @@ export default function App() {
         text: `Connected to ${targetHost} (${streamMetrics?.resolvedIp ?? targetHost})`,
         tone: "success",
       });
-    } else {
+    } else if (!otaJobRef.current?.active) {
       gameLog.print({
         text: `Disconnected from ${targetHost}`,
         tone: "info",
       });
     }
   }, [connected, targetHost, gameLog]);
+
+  // Mirror bridge-level Wi-Fi OTA / firmware build progress into the floating GameLogOverlay
+  // so updates triggered from any tab, CLI, or automation remain visible live in the UI.
+  useEffect(() => {
+    if (!otaJob) return;
+    const prefix = otaJob.phase === "building" ? "Build" : `OTA ${otaJob.progress}%`;
+    const activeText = `${prefix} · ${otaJob.message}`;
+
+    if (otaJob.active) {
+      if (
+        otaLineRef.current &&
+        otaLineJobIdRef.current === otaJob.id &&
+        !otaLineRef.current.isRemoved?.()
+      ) {
+        otaLineRef.current.update({ text: activeText, tone: "info" });
+      } else {
+        otaLineJobIdRef.current = otaJob.id;
+        otaLineRef.current = gameLog.print({ text: activeText, tone: "info" });
+      }
+      return;
+    }
+
+    const terminalKey = `${otaJob.id}:${otaJob.status}`;
+    if (otaTerminalLoggedRef.current === terminalKey) return;
+    otaTerminalLoggedRef.current = terminalKey;
+    const tone = otaJob.status === "done" ? "success" : "error";
+    const finalText = otaJob.status === "done"
+      ? otaJob.message
+      : (otaJob.error ? `OTA failed: ${otaJob.error}` : otaJob.message);
+    if (
+      otaLineRef.current &&
+      otaLineJobIdRef.current === otaJob.id &&
+      !otaLineRef.current.isRemoved?.()
+    ) {
+      otaLineRef.current.update({ text: finalText, tone });
+    } else {
+      otaLineJobIdRef.current = otaJob.id;
+      otaLineRef.current = gameLog.print({ text: finalText, tone });
+    }
+  }, [otaJob, gameLog]);
 
   // Route thermal warnings into the shared FOSS Earth floating log (auto-fades to peek chip,
   // swipe-dismissable, and refreshes live temps silently without re-popping over the 3D scene).
@@ -675,6 +1145,10 @@ export default function App() {
       tone: (level === "hot" ? "error" : "warning") as "error" | "warning",
       actions: [
         { label: "Screen Off (0%)", onClick: () => void setScreenOff() },
+        { label: "Wi-Fi Sleep", onClick: () => void setRobotPower("wifi-sleep", "lan") },
+        ...(health?.usbV != null && health.usbV >= 4.0
+          ? [{ label: "USB Sleep", onClick: () => void setRobotPower("usb-sleep", "lan") }]
+          : []),
         ...(level === "hot"
           ? [{ label: "Disconnect", onClick: () => void disconnectWifi() }]
           : []),
@@ -987,6 +1461,15 @@ export default function App() {
           </div>
         );
 
+      case "control":
+        return (
+          <ControlLabPanel
+            connected={connected}
+            historyRef={historyRef}
+            onSendCmd={sendRobotCommand}
+          />
+        );
+
       case "calibrate":
         return (
           <CalibrationHilPanel
@@ -1008,6 +1491,17 @@ export default function App() {
         );
 
       case "camera":
+        return (
+          <FpvCamPanel
+            camera={camera}
+            robotConnected={connected}
+            robotPitchDeg={pitchDegDisplay}
+            robotRollDeg={rollDegDisplay}
+            onNotice={onCameraNotice}
+          />
+        );
+
+      case "view3d":
         return (
           <div style={{ padding: 12, display: "flex", flexDirection: "column", gap: 10, fontSize: "0.82rem" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -1081,7 +1575,7 @@ export default function App() {
               </label>
             </div>
             <div style={{ color: "var(--muted)", fontSize: "0.74rem", lineHeight: 1.35 }}>
-              Trackpad: two-finger swipe orbits, pinch or Option/Alt+swipe zooms with FOSS Earth inertial glide.
+              Trackpad: two-finger swipe orbits, pinch or Option/Alt+swipe zooms with exponential inertial glide.
             </div>
           </div>
         );
@@ -1197,32 +1691,38 @@ export default function App() {
 
       case "cpu":
         return (
-          <CpuPanel
-            connected={connected}
-            system={connected ? systemSnap : null}
-            onSendCmd={(c) => void sendRobotCommand(c)}
-            onScreenOff={() => void setScreenOff()}
-          />
+          <CameraSystemMonitor kind="cpu" status={cameraStatus}>
+            <CpuPanel
+              connected={connected}
+              system={connected ? systemSnap : null}
+              onSendCmd={(c) => void sendRobotCommand(c)}
+              onScreenOff={() => void setScreenOff()}
+            />
+          </CameraSystemMonitor>
         );
 
       case "ram":
         return (
-          <RamPanel
-            connected={connected}
-            system={connected ? systemSnap : null}
-            onSendCmd={(c) => void sendRobotCommand(c)}
-          />
+          <CameraSystemMonitor kind="ram" status={cameraStatus}>
+            <RamPanel
+              connected={connected}
+              system={connected ? systemSnap : null}
+              onSendCmd={(c) => void sendRobotCommand(c)}
+            />
+          </CameraSystemMonitor>
         );
 
       case "flash":
         return (
-          <FlashPanel
-            connected={connected}
-            response={flashRevision == null || flashSnapshot?.revision === flashRevision ? flashSnapshot : null}
-            health={health}
-            onRefresh={() => setFlashRefresh((n) => n + 1)}
-            onSendCmd={(c) => void sendRobotCommand(c)}
-          />
+          <CameraSystemMonitor kind="flash" status={cameraStatus}>
+            <FlashPanel
+              connected={connected}
+              response={flashRevision == null || flashSnapshot?.revision === flashRevision ? flashSnapshot : null}
+              health={health}
+              onRefresh={() => setFlashRefresh((n) => n + 1)}
+              onSendCmd={(c) => void sendRobotCommand(c)}
+            />
+          </CameraSystemMonitor>
         );
 
       case "ota":
@@ -1231,6 +1731,18 @@ export default function App() {
             connected={connected}
             health={health}
             targetHost={targetHost}
+            otaJob={otaJob}
+          />
+        );
+
+      case "comms":
+        return (
+          <CommunicationsPanel
+            visible={tabVisibility.comms === true}
+            connected={connected}
+            powerMode={powerMode}
+            onConnect={() => void connectWifi()}
+            onDisconnect={() => void disconnectWifi()}
           />
         );
 
@@ -1268,78 +1780,320 @@ export default function App() {
 
       <div className="balax-controls" ref={controlsRef}>
         <div className="balax-hud">
-          <span
-            className={`badge ${connected ? "online" : "offline"}`}
-            style={
-              connected
-                ? { borderColor: rateColor, color: rateColor }
-                : undefined
-            }
-            title={
-              telemetryAvailable && streamMetrics
-                ? `Live poll ${actualPollHz.toFixed(1)}/${effectiveTargetHz} Hz · IMU ${streamMetrics.sampleRateHz.toFixed(0)} sps · RTT ${streamMetrics.avgRttMs.toFixed(0)} ms (${streamMetrics.pipelinedNonce ? "1-RTT" : "2-RTT"}) · ${streamMetrics.resolvedIp} (${streamMetrics.resolvedVia})`
-                : connected ? "Robot connected. Live telemetry unavailable." : "Robot offline"
-            }
-          >
-            {telemetryAvailable ? `${actualPollHz.toFixed(1)} Hz · ${streamMetrics ? `${streamMetrics.avgRttMs.toFixed(0)}ms` : "LIVE"}`
-              : connected ? "CONNECTED" : "OFFLINE"}
-          </span>
-          <input
-            value={targetHost}
-            onChange={(e) => setTargetHost(e.target.value)}
-            disabled={connected}
-            aria-label="Robot hostname"
-            placeholder="balax.local"
-            style={{ width: 115, padding: "4px 8px", fontSize: "0.78rem", opacity: connected ? 0.72 : 1 }}
-          />
-          <button
-            className={connected ? "danger" : "primary"}
-            style={{ padding: "4px 10px", fontSize: "0.78rem" }}
-            onClick={() => void (connected ? disconnectWifi() : connectWifi())}
-            title={
-              connected
-                ? "Disconnect bridge and stop 100 Hz telemetry stream to save robot battery & heat"
-                : "Connect to robot over Wi-Fi"
-            }
-          >
-            {connected ? "Disconnect" : "Connect"}
-          </button>
-          <button
-            className="primary"
-            disabled={zeroingImu}
-            style={{ padding: "4px 10px", fontSize: "0.78rem" }}
-            onClick={() => void zeroImuAndSaveFlash()}
-            title="Zero 6-axis IMU biases (hold still ~1s) and save permanently to NVS flash"
-          >
-            {zeroingImu ? "Zeroing..." : "Zero IMU"}
-          </button>
-          <button
-            style={{ padding: "4px 10px", fontSize: "0.78rem" }}
-            onClick={centerSimPose}
-            title="Recenter 3D pose (X, Y, Z & yaw) without recalibrating flash"
-          >
-            Center
-          </button>
-          <button
-            className="success"
-            style={{ padding: "4px 10px", fontSize: "0.78rem" }}
-            onClick={() => void sendRobotCommand("arm")}
-          >
-            ARM
-          </button>
-          <button
-            className="danger"
-            style={{ padding: "4px 10px", fontSize: "0.78rem" }}
-            onClick={() => void sendRobotCommand("disarm")}
-          >
-            DISARM
-          </button>
-          <button
-            style={{ padding: "4px 10px", fontSize: "0.78rem" }}
-            onClick={() => void sendRobotCommand("takeoff")}
-          >
-            Takeoff
-          </button>
+          {(() => {
+            const effStickCUsbAvailable = stickCSerial.connected || usbAvailable;
+            const effStickCUsbPort = stickCSerial.portLabel ?? usbPort;
+            const effStickCConnected = connected || stickCSerial.connected;
+            const stickCComm = resolveStickCComm({
+              choice: stickCSerial.connected && stickCCommChoice === "auto" ? "usb" : stickCCommChoice,
+              connected: effStickCConnected,
+              powerMode,
+              usbAvailable: effStickCUsbAvailable,
+              usbV: health?.usbV ?? null,
+            });
+            const stickCState = resolveStickCStateDisplay({
+              forcedState: stickCForcedState,
+              connected: effStickCConnected,
+              powerMode,
+              otaActive: Boolean(otaJob?.active),
+              otaPhase: otaJob?.phase,
+              otaProgress: otaJob?.progress,
+            });
+            const camComm = resolveCamComm({
+              choice: camTransport,
+              activeTransport: cameraStatus?.activeTransport,
+              usbPort: cameraStatus?.usbPort,
+              ip: cameraStatus?.ip,
+              available: Boolean(cameraStatus?.available),
+            });
+            const camState = resolveCamStateDisplay({
+              forcedState: camForcedState,
+              status: cameraStatus,
+            });
+            const robotState = latest?.state ?? "";
+            const isArmed = ["ARMED", "LEVELING", "TAKEOFF", "BALANCING"].includes(robotState);
+            const isFallen = robotState === "FALLEN";
+            const canTakeoff = connected && (robotState === "READY" || robotState === "ARMED");
+            const stickCMetric = otaJob?.active
+              ? null
+              : telemetryAvailable && streamMetrics
+                ? `${actualPollHz.toFixed(0)}Hz · ${streamMetrics.avgRttMs.toFixed(0)}ms`
+                : null;
+            const camMetric = cameraStatus?.flashJob?.status === "running"
+              ? null
+              : camState.liveState === "streaming" && (cameraStatus?.fps ?? 0) > 0
+                ? `${cameraStatus!.fps.toFixed(0)}fps${cameraStatus?.dieTempC != null ? ` · ${cameraStatus.dieTempC.toFixed(0)}°C` : ""}`
+                : cameraStatus?.dieTempC != null && camState.liveState !== "offline"
+                  ? `${cameraStatus.dieTempC.toFixed(0)}°C`
+                  : null;
+            const canStickCWifiSleep = effStickCConnected || powerMode === "wifi-sleep";
+            const canStickCUsbSleep = stickCComm.canUsbSleep;
+            const canCamWake = camState.liveState === "sleep" || camState.liveState === "offline";
+
+            return (
+              <>
+                <DeviceControlGroup<StickCCommChoice, StickCStateChoice>
+                  name="StickC"
+                  statusTone={stickCState.tone}
+                  metric={stickCMetric}
+                  busy={powerBusy || Boolean(otaJob?.active)}
+                  statusTitle={
+                    otaJob?.active
+                      ? `${otaJob.message} (${otaJob.progress}%)`
+                      : telemetryAvailable && streamMetrics
+                        ? `${targetHost} · Poll ${actualPollHz.toFixed(1)}/${effectiveTargetHz} Hz · IMU ${streamMetrics.sampleRateHz.toFixed(0)} sps · RTT ${streamMetrics.avgRttMs.toFixed(0)} ms · ${streamMetrics.resolvedIp}`
+                        : `${targetHost} · ${stickCState.liveLabel}${effStickCUsbPort ? ` · USB ${effStickCUsbPort}` : ""}`
+                  }
+                  commValue={stickCCommChoice}
+                  commLabel={stickCComm.label}
+                  commTone={stickCComm.tone}
+                  commForced={!stickCComm.isAuto}
+                  commTitle={`StickC comm: ${stickCComm.label}${effStickCUsbPort ? ` (${effStickCUsbPort})` : ""}`}
+                  commOptions={[
+                    {
+                      value: "auto",
+                      label: "Auto",
+                      badge: "Default",
+                      description: `Active: ${stickCComm.active === "usb" ? "USB" : "Wi-Fi"}`,
+                    },
+                    {
+                      value: "wifi",
+                      label: "Wi-Fi",
+                      badge: connected ? "Live" : runtimeMode === "standalone" ? "Bridge" : undefined,
+                      description: runtimeMode === "standalone"
+                        ? "Requires local `npm run dev` LAN bridge"
+                        : `LAN bridge (${targetHost})`,
+                    },
+                    {
+                      value: "usb",
+                      label: "USB",
+                      badge: stickCSerial.connected
+                        ? "Web Serial"
+                        : effStickCUsbPort
+                          ? "Plugged"
+                          : hasWebSerial()
+                            ? "Connect…"
+                            : "Unplugged",
+                      description: effStickCUsbPort
+                        ? effStickCUsbPort
+                        : hasWebSerial()
+                          ? "Click to connect StickC via browser Web Serial"
+                          : "No StickC USB serial port detected",
+                    },
+                  ]}
+                  onSelectComm={(next) => void handleStickCCommSelect(next)}
+                  hostEditor={{
+                    label: "Host",
+                    value: targetHost,
+                    placeholder: "balax.local",
+                    onChange: (next) => setTargetHost(next),
+                    onCommit: (next) => {
+                      if (next.trim() && connected) void connectWifi();
+                    },
+                  }}
+                  stateValue={stickCForcedState}
+                  stateLabel={stickCState.label}
+                  stateLiveLabel={stickCState.liveLabel}
+                  stateTone={stickCState.tone}
+                  stateForced={stickCState.isForced}
+                  stateTitle={`StickC state: ${stickCState.label} (click to force state)`}
+                  stateOptions={[
+                    {
+                      value: "auto",
+                      label: "Auto",
+                      badge: "Default",
+                      description: `Track live state (${stickCState.liveLabel})`,
+                    },
+                    {
+                      value: "awake",
+                      label: "Awake / Connect",
+                      tone: "primary",
+                      description:
+                        powerMode === "wifi-sleep"
+                          ? "Wake StickC over Wi-Fi and reconnect"
+                          : stickCComm.active === "usb" && usbAvailable
+                            ? "Wake StickC over USB (RTS→EN)"
+                            : `Connect bridge to ${targetHost}`,
+                    },
+                    {
+                      value: "wifi-sleep",
+                      label: "Wi-Fi Sleep",
+                      tone: "warning",
+                      disabled: !canStickCWifiSleep,
+                      description: canStickCWifiSleep
+                        ? "Low-power Wi-Fi sleep (faint 4s LED; wake over Wi-Fi)"
+                        : "Connect over Wi-Fi first",
+                    },
+                    {
+                      value: "usb-sleep",
+                      label: "USB Sleep",
+                      tone: "warning",
+                      disabled: !canStickCUsbSleep,
+                      description: canStickCUsbSleep
+                        ? "Deep sleep for cool USB charging (wake over USB)"
+                        : "Requires StickC USB connection",
+                    },
+                    {
+                      value: "offline",
+                      label: "Disconnect",
+                      tone: "danger",
+                      description: "Pause bridge telemetry stream without sleeping StickC",
+                    },
+                  ]}
+                  onSelectState={(next) => void handleStickCStateSelect(next, stickCComm.active)}
+                />
+
+                <DeviceControlGroup<CamCommChoice, CamStateChoice>
+                  name="ESP32-CAM"
+                  statusTone={camState.tone}
+                  metric={camMetric}
+                  busy={camBusy || cameraStatus?.flashJob?.status === "running"}
+                  statusTitle={`${camera.host}${cameraStatus?.ip ? ` (${cameraStatus.ip})` : ""} · ${camState.liveLabel}${cameraStatus?.usbPort ? ` · USB ${cameraStatus.usbPort}` : ""}`}
+                  commValue={camTransport}
+                  commLabel={camComm.label}
+                  commTone={camComm.tone}
+                  commForced={!camComm.isAuto}
+                  commTitle={`ESP32-CAM comm: ${camComm.label}${cameraStatus?.usbPort ? ` (${cameraStatus.usbPort})` : ""}`}
+                  commOptions={[
+                    {
+                      value: "auto",
+                      label: "Auto",
+                      badge: "Default",
+                      description: "Prefer Wi-Fi UDP, fallback HTTP / USB",
+                    },
+                    {
+                      value: "udp",
+                      label: "Wi-Fi UDP",
+                      badge: camComm.active === "udp" ? "Live" : undefined,
+                      description: "Low-latency ECL1 UDP stream",
+                    },
+                    {
+                      value: "http",
+                      label: "Wi-Fi HTTP",
+                      badge: camComm.active === "http" ? "Live" : undefined,
+                      description: "HTTP MJPEG fallback stream",
+                    },
+                    {
+                      value: "usb",
+                      label: "USB",
+                      badge: camera.directUsbConnected
+                        ? "Web Serial"
+                        : cameraStatus?.usbPort
+                          ? "Plugged"
+                          : hasWebSerial()
+                            ? "Connect…"
+                            : "Unplugged",
+                      description: cameraStatus?.usbPort
+                        ?? (hasWebSerial()
+                          ? "Click to connect ESP32-FPV via browser Web Serial (921600 baud)"
+                          : "No ESP32-CAM USB serial port detected"),
+                    },
+                  ]}
+                  onSelectComm={(next) => void handleCamCommSelect(next)}
+                  hostEditor={{
+                    label: "Host",
+                    value: camHostValue,
+                    placeholder: DEFAULT_CAMERA_HOST,
+                    onChange: (next) => camera.settings.set(CAMERA_SETTING.host, next),
+                    onCommit: () => void camera.fetchStatus(true),
+                  }}
+                  stateValue={camForcedState}
+                  stateLabel={camState.label}
+                  stateLiveLabel={camState.liveLabel}
+                  stateTone={camState.tone}
+                  stateForced={camState.isForced}
+                  stateTitle={`ESP32-CAM state: ${camState.label} (click to force state)`}
+                  stateOptions={[
+                    {
+                      value: "auto",
+                      label: "Auto",
+                      badge: "Default",
+                      description: `Track live state (${camState.liveLabel})`,
+                    },
+                    {
+                      value: "streaming",
+                      label: "Streaming",
+                      tone: "primary",
+                      description: `Start FPV stream via ${camComm.label}`,
+                    },
+                    {
+                      value: "idle",
+                      label: "Cool Idle",
+                      tone: "warning",
+                      description: "Cut OV2640 power (GPIO32 HIGH) → 40 MHz Wi-Fi idle",
+                    },
+                    {
+                      value: "sleep",
+                      label: "Deep Sleep",
+                      tone: "danger",
+                      description: "~10 µA deep sleep (wake via USB RTS→EN or Reset)",
+                    },
+                  ]}
+                  onSelectState={(next) => void handleCamStateSelect(next)}
+                  extraStateAction={
+                    canCamWake
+                      ? {
+                          label: camTransport === "usb" || cameraStatus?.usbPort ? "Wake via USB" : "Wake Camera",
+                          description: cameraStatus?.usbPort
+                            ? `Pulse RTS→EN on ${cameraStatus.usbPort}`
+                            : "Send wake request to ESP32-CAM",
+                          onClick: () => void handleCamWake(),
+                        }
+                      : null
+                  }
+                />
+
+                {connected && (
+                  <button
+                    className={isArmed || isFallen ? "danger" : "success"}
+                    style={{ padding: "4px 11px", fontSize: "0.78rem" }}
+                    onClick={() => void sendRobotCommand(isArmed || isFallen ? "disarm" : "arm")}
+                    title={
+                      isFallen
+                        ? "Acknowledge fall and disarm motors"
+                        : isArmed
+                          ? "Disarm motors immediately"
+                          : "Arm BalaX (stand upright to balance)"
+                    }
+                  >
+                    {isFallen ? "Ack / Disarm" : isArmed ? "Disarm" : "Arm"}
+                  </button>
+                )}
+
+                {canTakeoff && (
+                  <button
+                    className="primary"
+                    style={{ padding: "4px 10px", fontSize: "0.78rem" }}
+                    onClick={() => void sendRobotCommand("takeoff")}
+                    title="Pop up from lying flat into balancing"
+                  >
+                    Takeoff
+                  </button>
+                )}
+
+                {connected && !isArmed && (
+                  <button
+                    style={{ padding: "4px 9px", fontSize: "0.78rem" }}
+                    disabled={zeroingImu}
+                    onClick={() => void zeroImuAndSaveFlash()}
+                    title="Zero 6-axis IMU biases (hold still ~1s) and save to flash"
+                  >
+                    {zeroingImu ? "Zeroing..." : "Zero IMU"}
+                  </button>
+                )}
+
+                {connected && (
+                  <button
+                    style={{ padding: "4px 9px", fontSize: "0.78rem" }}
+                    onClick={centerSimPose}
+                    title="Recenter 3D pose without recalibrating flash"
+                  >
+                    Center
+                  </button>
+                )}
+              </>
+            );
+          })()}
           {connected && <span style={{ color: "var(--muted)", marginLeft: 4 }}>
             <strong>{latest?.state ?? "—"}</strong> · P{" "}
             <strong>{latest ? `${pitchDegDisplay.toFixed(1)}°` : "—"}</strong> R{" "}
@@ -1363,54 +2117,42 @@ export default function App() {
               </>
             )}
           </span>}
+          {!connected && powerMode === "wifi-sleep" && health && (
+            <span style={{ color: "var(--muted)", marginLeft: 4 }} title="Slow passive telemetry (15s poll, robot stays in Wi-Fi sleep)">
+              {pmicC !== null && (
+                <>
+                  <strong style={{ color: thermalColor }}>{pmicC.toFixed(0)}°C</strong>
+                </>
+              )}
+              {batteryPct !== null && (
+                <>
+                  {pmicC !== null ? " · " : ""}
+                  <strong style={{ color: isLowBattery ? "#d29922" : "#3fb950" }}>
+                    {batteryPct.toFixed(0)}%
+                  </strong>
+                  {health.batteryV !== null ? ` (${health.batteryV.toFixed(2)}V)` : ""}
+                </>
+              )}
+              {health.usbV !== null && health.usbV >= 4.0 && (
+                <>
+                  {" · "}
+                  <strong style={{ color: "#58a6ff" }}>USB {health.usbV.toFixed(1)}V</strong>
+                </>
+              )}
+            </span>
+          )}
           {imuNotice && <span style={{ color: "var(--muted)" }}>{imuNotice}</span>}
         </div>
 
-        {/* Touch Joystick Pad in bottom-right corner */}
-        <div
-          className="balax-joystick"
-          style={{
-            borderRadius: "50%",
-            background: "rgba(8, 15, 27, 0.88)",
-            border: "1px solid rgba(148, 163, 184, 0.3)",
-            backdropFilter: "blur(12px)",
-            touchAction: "none",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            fontSize: "0.72rem",
-            color: "var(--muted)",
-            userSelect: "none",
-          }}
-          onPointerDown={(e) => {
-            e.currentTarget.setPointerCapture(e.pointerId);
-            const rect = e.currentTarget.getBoundingClientRect();
-            setOrigin({ x: e.clientX - rect.left, y: e.clientY - rect.top });
-          }}
-          onPointerMove={(e) => {
-            if (!origin) return;
-            const rect = e.currentTarget.getBoundingClientRect();
-            setStick(
-              computeStickVector(
-                origin.x,
-                origin.y,
-                e.clientX - rect.left,
-                e.clientY - rect.top,
-                44
-              )
-            );
-          }}
-          onPointerUp={() => {
-            setOrigin(null);
-            setStick({ x: 0, y: 0 });
-          }}
-          onLostPointerCapture={() => {
-            setOrigin(null);
-            setStick({ x: 0, y: 0 });
-          }}
-        >
-          Drive {(stick.y * 100).toFixed(0)}% / {(stick.x * 100).toFixed(0)}%
-        </div>
+        {/* Dual-motor drive joystick pad in bottom-right corner */}
+        <DualMotorDrivePad
+          connected={connected}
+          robotState={latest?.state ?? ""}
+          motorL={latest?.motorL ?? 0}
+          motorR={latest?.motorR ?? 0}
+          remoteStick={remoteStick}
+          onChange={handleDriveStickChange}
+        />
       </div>
     </div>
   );

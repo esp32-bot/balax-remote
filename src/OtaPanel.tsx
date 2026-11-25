@@ -6,6 +6,11 @@ import {
   downloadAndCacheGitHubFirmware,
   sha256Hex,
 } from "@g-ai/rc";
+import { UsbFlashCard, useUsbFlash } from "./UsbFlashCard";
+import { CamOtaSection } from "./CamOtaSection";
+import { BrowserWebSerialFlashCard } from "./BrowserWebSerialFlashCard";
+import { detectRuntimeMode } from "./runtimeMode";
+import type { OtaJobSnapshot } from "./otaProtocol";
 
 export interface OtaHealth {
   pmicC: number | null;
@@ -32,6 +37,7 @@ interface OtaInfoResponse {
   connected: boolean;
   otaBusy: boolean;
   buildBusy: boolean;
+  otaJob?: OtaJobSnapshot | null;
   robotPartition: string | null;
   robotVersion: string | null;
   binary: BinaryMeta;
@@ -47,6 +53,7 @@ interface OtaPanelProps {
   connected: boolean;
   health: OtaHealth | null;
   targetHost: string;
+  otaJob?: OtaJobSnapshot | null;
 }
 
 function formatAge(ms: number): string {
@@ -63,7 +70,9 @@ export const OtaPanel: React.FC<OtaPanelProps> = ({
   connected,
   health,
   targetHost,
+  otaJob,
 }) => {
+  const [targetDevice, setTargetDevice] = useState<"balax" | "cam">("balax");
   const [info, setInfo] = useState<OtaInfoResponse | null>(null);
   const fwStoreRef = useRef<IndexedDbArtifactStore | null>(null);
   if (!fwStoreRef.current) fwStoreRef.current = new IndexedDbArtifactStore();
@@ -95,8 +104,11 @@ export const OtaPanel: React.FC<OtaPanelProps> = ({
   const [detailLog, setDetailLog] = useState<string>("");
   const [forceOverride, setForceOverride] = useState(false);
   const [customFile, setCustomFile] = useState<File | null>(null);
+  const usb = useUsbFlash();
 
   const refreshInfo = useCallback(async () => {
+    const mode = await detectRuntimeMode();
+    if (mode !== "bridge") return;
     try {
       const res = await fetch("/api/bridge/ota/info");
       if (!res.ok) return;
@@ -143,7 +155,9 @@ export const OtaPanel: React.FC<OtaPanelProps> = ({
   }
 
   const safetyBlocked = blockers.filter((b) => !b.includes("offline")).length > 0;
-  const busy = phase === "building" || phase === "flashing" || Boolean(info?.otaBusy) || Boolean(info?.buildBusy);
+  const liveOtaJob = otaJob ?? info?.otaJob ?? null;
+  const wifiBusy = phase === "building" || phase === "flashing" || Boolean(liveOtaJob?.active) || Boolean(info?.otaBusy) || Boolean(info?.buildBusy);
+  const busy = wifiBusy || usb.pending;
   const canFlashLocal = connected && Boolean(info?.binary.exists) && !busy && (!safetyBlocked || forceOverride);
   const canFlashCustom = connected && Boolean(customFile) && !busy && (!safetyBlocked || forceOverride);
 
@@ -326,6 +340,68 @@ export const OtaPanel: React.FC<OtaPanelProps> = ({
 
   return (
     <div style={{ padding: 12, display: "flex", flexDirection: "column", gap: 10, fontSize: "0.78rem" }}>
+      {/* Target Device Switcher: BalaX vs ESP32-CAM */}
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "1fr 1fr",
+          gap: 6,
+          background: "#0d1117",
+          border: "1px solid var(--border)",
+          borderRadius: 8,
+          padding: 4,
+        }}
+      >
+        <button
+          type="button"
+          onClick={() => setTargetDevice("balax")}
+          style={{
+            padding: "5px 8px",
+            borderRadius: 6,
+            fontWeight: 600,
+            fontSize: "0.74rem",
+            background: targetDevice === "balax" ? "rgba(56, 139, 253, 0.22)" : "transparent",
+            borderColor: targetDevice === "balax" ? "rgba(56, 139, 253, 0.55)" : "transparent",
+            color: targetDevice === "balax" ? "#79c0ff" : "var(--muted)",
+          }}
+        >
+          BalaX (M5StickC Plus)
+        </button>
+        <button
+          type="button"
+          onClick={() => setTargetDevice("cam")}
+          style={{
+            padding: "5px 8px",
+            borderRadius: 6,
+            fontWeight: 600,
+            fontSize: "0.74rem",
+            background: targetDevice === "cam" ? "rgba(56, 139, 253, 0.22)" : "transparent",
+            borderColor: targetDevice === "cam" ? "rgba(56, 139, 253, 0.55)" : "transparent",
+            color: targetDevice === "cam" ? "#79c0ff" : "var(--muted)",
+          }}
+        >
+          ESP32-CAM (OV2640)
+        </button>
+      </div>
+
+      {targetDevice === "cam" ? (
+        <CamOtaSection
+          fwStore={fwStoreRef.current!}
+          cachedFw={cachedFw}
+          onRefreshCache={refreshFwCache}
+        />
+      ) : (
+        <>
+      <BrowserWebSerialFlashCard
+          target="stickc"
+          fwStore={fwStoreRef.current!}
+          cachedFw={cachedFw}
+          onComplete={(msg) => {
+            setPhase("done");
+            setStatusMsg(msg);
+          }}
+        />
+        <UsbFlashCard usb={usb} wifiBusy={wifiBusy} />
       {/* Pre-flight Safety Checklist */}
       <div
         style={{
@@ -379,7 +455,78 @@ export const OtaPanel: React.FC<OtaPanelProps> = ({
         </div>
       </div>
 
-      {/* Local Build & Flash Card */}
+      {/* Live Wi-Fi OTA / Build Progress (synced from bridge for all tabs & CLI/agent updates) */}
+      {liveOtaJob && (
+        <div
+          style={{
+            background:
+              liveOtaJob.status === "error"
+                ? "rgba(248, 81, 73, 0.12)"
+                : liveOtaJob.status === "done"
+                  ? "rgba(63, 185, 80, 0.12)"
+                  : "rgba(88, 166, 255, 0.12)",
+            border:
+              liveOtaJob.status === "error"
+                ? "1px solid rgba(248, 81, 73, 0.5)"
+                : liveOtaJob.status === "done"
+                  ? "1px solid rgba(63, 185, 80, 0.5)"
+                  : "1px solid rgba(88, 166, 255, 0.5)",
+            borderRadius: 8,
+            padding: "8px 10px",
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
+          }}
+        >
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+            <strong
+              style={{
+                color:
+                  liveOtaJob.status === "error"
+                    ? "#f85149"
+                    : liveOtaJob.status === "done"
+                      ? "#3fb950"
+                      : "#79c0ff",
+              }}
+            >
+              {liveOtaJob.message}
+            </strong>
+            <span style={{ color: "var(--muted)", fontSize: "0.72rem", whiteSpace: "nowrap" }}>
+              {liveOtaJob.active ? `${liveOtaJob.progress}%` : liveOtaJob.status.toUpperCase()}
+            </span>
+          </div>
+          <div
+            style={{
+              height: 6,
+              borderRadius: 999,
+              background: "rgba(13, 17, 23, 0.85)",
+              overflow: "hidden",
+              border: "1px solid rgba(48, 54, 61, 0.8)",
+            }}
+          >
+            <div
+              style={{
+                width: `${Math.max(2, Math.min(100, liveOtaJob.progress))}%`,
+                height: "100%",
+                background:
+                  liveOtaJob.status === "error"
+                    ? "#f85149"
+                    : liveOtaJob.status === "done"
+                      ? "#3fb950"
+                      : "#58a6ff",
+                transition: "width 180ms ease-out",
+              }}
+            />
+          </div>
+          {liveOtaJob.error && (
+            <div style={{ color: "#fca5a5", fontSize: "0.72rem", whiteSpace: "pre-wrap" }}>
+              {liveOtaJob.error}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Wi-Fi OTA from the laptop build */}
       <div
         style={{
           background: "#0d1117",
@@ -392,7 +539,7 @@ export const OtaPanel: React.FC<OtaPanelProps> = ({
         }}
       >
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <strong>Local laptop build (<code>balax.bin</code>)</strong>
+          <strong>Wi-Fi OTA · Local laptop build (<code>balax.bin</code>)</strong>
           <span style={{ color: "var(--muted)", fontSize: "0.72rem" }}>
             {info?.binary.exists
               ? `${(info.binary.sizeBytes / 1024).toFixed(0)} KB · ${formatAge(info.binary.modifiedAtMs)} · #${info.binary.sha256Short}`
@@ -407,11 +554,15 @@ export const OtaPanel: React.FC<OtaPanelProps> = ({
             style={{ padding: "5px 11px", fontSize: "0.77rem", fontWeight: 600 }}
             onClick={() => void runBuildAndFlash()}
           >
-            {phase === "building"
-              ? `Building... (${elapsedSec}s)`
-              : phase === "flashing"
-                ? `Flashing... (${elapsedSec}s)`
-                : "Build & Flash"}
+            {liveOtaJob?.active
+              ? liveOtaJob.phase === "building"
+                ? "Building..."
+                : `Flashing ${liveOtaJob.progress}%...`
+              : phase === "building"
+                ? `Building... (${elapsedSec}s)`
+                : phase === "flashing"
+                  ? `Flashing... (${elapsedSec}s)`
+                  : "Build & Flash"}
           </button>
           <button
             disabled={!canFlashLocal}
@@ -519,7 +670,7 @@ export const OtaPanel: React.FC<OtaPanelProps> = ({
             Download & Cache
           </button>
           <button
-            disabled={ghBusy || !connected || phase === "flashing"}
+            disabled={ghBusy || !connected || busy}
             style={{ padding: "4px 9px", fontSize: "0.74rem" }}
             onClick={() => void fetchGitHubAndCache(true)}
           >
@@ -597,7 +748,7 @@ export const OtaPanel: React.FC<OtaPanelProps> = ({
                     {fw.pinned ? "Unpin" : "Pin"}
                   </button>
                   <button
-                    disabled={!connected || phase === "flashing"}
+                    disabled={!connected || busy}
                     style={{ fontSize: "0.68rem", padding: "2px 6px" }}
                     onClick={() => void flashFromBrowserCache(fw.sha256)}
                   >
@@ -656,6 +807,8 @@ export const OtaPanel: React.FC<OtaPanelProps> = ({
             </pre>
           )}
         </div>
+      )}
+        </>
       )}
     </div>
   );
